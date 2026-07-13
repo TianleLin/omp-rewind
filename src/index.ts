@@ -4,6 +4,9 @@
  * Binds git workspace checkpoints to session-tree entry IDs so OMP's native
  * double-Esc tree navigation restores conversation and files together.
  *
+ * All checkpoint data lives in a SHADOW git dir under the extension cache;
+ * the workspace's own .git is never polluted (no refs, no objects).
+ *
  * Checkpoint schedule (granularity "tool", the default):
  *   - before each agent turn  → ref bound to the current leaf entry
  *   - after each mutating tool → ref bound to the just-persisted entry
@@ -11,7 +14,7 @@
  *
  * Restore semantics (the contract):
  *   - navigation target resolves to the nearest self-or-ancestor checkpoint
- *   - worktree + index only; HEAD and branch pointer are never moved
+ *   - worktree files + staged/unstaged split; HEAD and branch never move
  *   - before restoring, the leaving state is checkpointed against the old
  *     leaf, so undo = navigate back to the node you came from
  */
@@ -24,11 +27,13 @@ import {
 	git,
 	listCheckpointRefs,
 	loadCheckpoint,
+	openShadow,
 	pruneCheckpoints,
 	READ_ONLY_TOOLS,
 	refComponent,
 	RestoreBlockedError,
 	restoreCheckpoint,
+	type ShadowRepo,
 } from "./core.ts";
 import type {
 	BeforeTreeResult,
@@ -42,16 +47,13 @@ const STATUS_KEY = "omp-rewind";
 /** Entry-ID stand-in for the empty tree (leaf = null). */
 const ROOT_ENTRY = "root";
 
-type RestoreMode = "all" | "conversation" | "cancel";
-
 interface PendingRestore {
-	mode: RestoreMode;
+	mode: "all" | "conversation";
 	checkpoint: CheckpointMeta | null;
 }
 
 interface State {
-	enabled: boolean;
-	root: string;
+	shadow: ShadowRepo | null;
 	sessionId: string;
 	granularity: "tool" | "turn";
 	/** Decision taken in session_before_tree, executed in session_tree. */
@@ -68,24 +70,9 @@ function isUserish(entry: SessionEntryLike | undefined): boolean {
 	return entry.type === "message" && role === "user";
 }
 
-/**
- * The leaf the session will have after navigating to `targetId`:
- * user/custom messages move the leaf to their parent, everything else
- * becomes the leaf itself (mirrors OMP's navigateTree rules).
- */
-function effectiveNewLeaf(
-	ctx: ExtensionContextLike,
-	targetId: string,
-): string | null {
-	const entry = ctx.sessionManager.getEntry(targetId);
-	if (!entry) return targetId;
-	return isUserish(entry) ? entry.parentId : targetId;
-}
-
 export default function (pi: PiApiLike) {
 	const state: State = {
-		enabled: false,
-		root: "",
+		shadow: null,
 		sessionId: "",
 		granularity:
 			process.env.OMP_REWIND_GRANULARITY === "turn" ? "turn" : "tool",
@@ -96,11 +83,11 @@ export default function (pi: PiApiLike) {
 
 	const updateStatus = async (ctx: ExtensionContextLike): Promise<void> => {
 		if (!ctx.hasUI) return;
-		if (!state.enabled) {
+		if (!state.shadow) {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			return;
 		}
-		const count = await countSessionCheckpoints(state.root, state.sessionId);
+		const count = await countSessionCheckpoints(state.shadow, state.sessionId);
 		ctx.ui.setStatus(
 			STATUS_KEY,
 			`◆ ${count} checkpoint${count === 1 ? "" : "s"}`,
@@ -113,10 +100,12 @@ export default function (pi: PiApiLike) {
 		entryId: string,
 		label: string,
 	): Promise<void> => {
+		const shadow = state.shadow;
+		if (!shadow) return Promise.resolve();
 		const run = state.writing.then(async () => {
 			try {
 				await createCheckpoint({
-					root: state.root,
+					shadow,
 					sessionId: state.sessionId,
 					entryId,
 					label,
@@ -136,16 +125,31 @@ export default function (pi: PiApiLike) {
 	};
 
 	/**
+	 * The leaf the session will have after navigating to `targetId`:
+	 * user/custom messages move the leaf to their parent, everything else
+	 * becomes the leaf itself (mirrors OMP's navigateTree rules).
+	 */
+	const effectiveNewLeaf = (
+		ctx: ExtensionContextLike,
+		targetId: string,
+	): string | null => {
+		const entry = ctx.sessionManager.getEntry(targetId);
+		if (!entry) return targetId;
+		return isUserish(entry) ? entry.parentId : targetId;
+	};
+
+	/**
 	 * Nearest self-or-ancestor entry of `leafId` that has a checkpoint.
 	 * Returns the checkpoint plus whether it is exact (bound to leaf itself).
 	 */
 	const findRestorePoint = async (
+		shadow: ShadowRepo,
 		ctx: ExtensionContextLike,
 		leafId: string | null,
 	): Promise<{ checkpoint: CheckpointMeta; exact: boolean } | null> => {
 		const session = refComponent(state.sessionId);
 		const available = new Set<string>();
-		for (const listing of await listCheckpointRefs(state.root)) {
+		for (const listing of await listCheckpointRefs(shadow)) {
 			if (listing.sessionComponent === session) {
 				available.add(listing.entryComponent);
 			}
@@ -165,11 +169,7 @@ export default function (pi: PiApiLike) {
 
 		for (const entryId of chain) {
 			if (!available.has(refComponent(entryId))) continue;
-			const checkpoint = await loadCheckpoint(
-				state.root,
-				state.sessionId,
-				entryId,
-			);
+			const checkpoint = await loadCheckpoint(shadow, state.sessionId, entryId);
 			if (checkpoint) {
 				return { checkpoint, exact: entryId === (leafId ?? ROOT_ENTRY) };
 			}
@@ -195,19 +195,21 @@ export default function (pi: PiApiLike) {
 		state.pending = null;
 		state.busy = false;
 		state.sessionId = ctx.sessionManager.getSessionId();
-		state.root = await git(["rev-parse", "--show-toplevel"], ctx.cwd).catch(
+		const root = await git(["rev-parse", "--show-toplevel"], ctx.cwd).catch(
 			() => "",
 		);
-		state.enabled = state.root.length > 0;
-		if (!state.enabled) {
+		if (root.length === 0) {
+			state.shadow = null;
 			if (ctx.hasUI) {
 				ctx.ui.notify(
 					"omp-rewind disabled: not a git repository. File restore on tree navigation is unavailable.",
 					"info",
 				);
+				ctx.ui.setStatus(STATUS_KEY, undefined);
 			}
 			return;
 		}
+		state.shadow = await openShadow(root, state.sessionId);
 		await updateStatus(ctx);
 	});
 
@@ -216,14 +218,14 @@ export default function (pi: PiApiLike) {
 	// ========================================================================
 
 	pi.on("before_agent_start", async (_event, ctx) => {
-		if (!state.enabled || state.busy) return;
+		if (!state.shadow || state.busy) return;
 		await scheduleCheckpoint(ctx, currentLeafEntry(ctx), "turn-start");
 	});
 
 	pi.on(
 		"tool_execution_end",
 		async (event: { toolName?: string }, ctx: ExtensionContextLike) => {
-			if (!state.enabled || state.busy) return;
+			if (!state.shadow || state.busy) return;
 			if (state.granularity === "turn") return;
 			const toolName = event.toolName ?? "";
 			if (READ_ONLY_TOOLS[toolName]) return;
@@ -244,7 +246,8 @@ export default function (pi: PiApiLike) {
 			ctx: ExtensionContextLike,
 		): Promise<BeforeTreeResult | undefined> => {
 			state.pending = null;
-			if (!state.enabled || !ctx.hasUI) return undefined;
+			const shadow = state.shadow;
+			if (!shadow || !ctx.hasUI) return undefined;
 
 			const targetId = event.targetId ?? event.preparation?.targetId;
 			const oldLeafId =
@@ -266,7 +269,7 @@ export default function (pi: PiApiLike) {
 			await scheduleCheckpoint(ctx, oldLeafId ?? ROOT_ENTRY, "leaving");
 
 			const newLeaf = effectiveNewLeaf(ctx, targetId);
-			const found = await findRestorePoint(ctx, newLeaf);
+			const found = await findRestorePoint(shadow, ctx, newLeaf);
 			if (signal?.aborted) return { cancel: true };
 
 			if (!found) {
@@ -281,7 +284,7 @@ export default function (pi: PiApiLike) {
 
 			const { checkpoint, exact } = found;
 			const leaving = await loadCheckpoint(
-				state.root,
+				shadow,
 				state.sessionId,
 				oldLeafId ?? ROOT_ENTRY,
 			);
@@ -289,7 +292,7 @@ export default function (pi: PiApiLike) {
 				leaving === null
 					? ""
 					: await diffTreeStat(
-							state.root,
+							shadow,
 							leaving.worktreeTreeSha,
 							checkpoint.worktreeTreeSha,
 						);
@@ -338,7 +341,8 @@ export default function (pi: PiApiLike) {
 		) => {
 			const pending = state.pending;
 			state.pending = null;
-			if (!state.enabled || !pending) return;
+			const shadow = state.shadow;
+			if (!shadow || !pending) return;
 			if (pending.mode !== "all" || !pending.checkpoint) return;
 
 			state.busy = true;
@@ -346,13 +350,22 @@ export default function (pi: PiApiLike) {
 				await state.writing;
 				// Re-resolve from the authoritative new leaf; falls back to the
 				// decision-time checkpoint if resolution disagrees.
-				const found = await findRestorePoint(ctx, event.newLeafId ?? null);
-				await restoreCheckpoint(
-					state.root,
+				const found = await findRestorePoint(
+					shadow,
+					ctx,
+					event.newLeafId ?? null,
+				);
+				const result = await restoreCheckpoint(
+					shadow,
 					found?.checkpoint ?? pending.checkpoint,
 				);
 				if (ctx.hasUI) {
-					ctx.ui.notify("Files restored to checkpoint.", "info");
+					ctx.ui.notify(
+						result.stagedRestored
+							? "Files restored to checkpoint."
+							: "Files restored; staged/unstaged split could not be reproduced (HEAD moved), all changes are unstaged.",
+						"info",
+					);
 				}
 			} catch (error) {
 				const message =
@@ -373,18 +386,15 @@ export default function (pi: PiApiLike) {
 
 	pi.registerCommand("rewind-prune", {
 		description:
-			"Delete omp-rewind checkpoint refs. Default: other sessions only; 'all' wipes every session including this one.",
+			"Delete omp-rewind checkpoint refs from the shadow store. Default: other sessions only; 'all' wipes every session and packs the store.",
 		handler: async (args, ctx) => {
-			if (!state.enabled) {
+			const shadow = state.shadow;
+			if (!shadow) {
 				if (ctx.hasUI) ctx.ui.notify("omp-rewind is disabled here.", "warning");
 				return;
 			}
 			const scope = args.trim() === "all" ? "all" : "others";
-			const deleted = await pruneCheckpoints(
-				state.root,
-				scope,
-				state.sessionId,
-			);
+			const deleted = await pruneCheckpoints(shadow, scope, state.sessionId);
 			if (ctx.hasUI) {
 				ctx.ui.notify(
 					`Pruned ${deleted} checkpoint ref${deleted === 1 ? "" : "s"} (${scope}).`,

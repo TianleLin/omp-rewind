@@ -1,16 +1,23 @@
 /**
  * omp-rewind — pure git core. Zero OMP dependency; independently testable.
  *
- * Checkpoint = full workspace snapshot (tracked + staged + non-ignored
- * untracked) stored as a commit object referenced from
- * `refs/omp-rewind/<session>/<entry>`. Restore never moves HEAD or the
- * branch pointer; it only rewrites worktree + index.
+ * Architecture: a SHADOW repository (bare git dir under the extension cache)
+ * whose --work-tree points at the user's workspace. All checkpoint objects
+ * and refs live in the shadow; the workspace's own .git is NEVER written to
+ * by checkpointing (no refs, no objects, no reflog — nothing for
+ * `push --mirror`, GUIs, or backups to pick up).
+ *
+ * Checkpoint = full workspace snapshot (tracked + non-ignored untracked,
+ * plus the staged diff as a patch blob) stored as a commit at
+ * `refs/omp-rewind/<session>/<entry>` in the shadow. Restore never moves
+ * HEAD or the branch pointer; it rewrites worktree files and — as the one
+ * intentional workspace-index write — reproduces the staged/unstaged split.
  */
 
 import { spawn } from "node:child_process";
-import { rm } from "node:fs/promises";
-import { mkdtemp } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
+import { access, mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 export const REF_BASE = "refs/omp-rewind";
@@ -19,7 +26,7 @@ export const ZEROS = "0".repeat(40);
 /**
  * Tools that never mutate the workspace. Anything NOT listed causes a
  * checkpoint (unknown tools are treated as mutating; identical-tree
- * checkpoints are skipped by the caller, so over-triggering is cheap).
+ * checkpoints are cheap thanks to the persistent shadow index).
  */
 export const READ_ONLY_TOOLS: Record<string, true> = {
 	read: true,
@@ -39,12 +46,12 @@ export interface CheckpointMeta {
 	/** Raw session entry ID this snapshot is bound to ("root" for empty tree). */
 	entryId: string;
 	sessionId: string;
+	/** Workspace branch at snapshot time (restore is blocked cross-branch). */
 	branch: string;
 	headSha: string;
-	indexTreeSha: string;
 	worktreeTreeSha: string;
-	/** Untracked (non-ignored) paths at snapshot time — protected on restore. */
-	untracked: string[];
+	/** Shadow blob holding `diff --cached --binary` at snapshot time. */
+	stagedPatchBlob: string | null;
 	createdAt: string;
 	label?: string;
 }
@@ -52,8 +59,8 @@ export interface CheckpointMeta {
 export interface GitRunOptions {
 	env?: Record<string, string | undefined>;
 	input?: string;
-	/** Exit codes to tolerate (stdout still returned). */
-	okCodes?: number[];
+	/** Return stdout verbatim (default strips one trailing newline). */
+	raw?: boolean;
 }
 
 /** Run git with an args array (no shell, no quoting pitfalls). */
@@ -79,8 +86,8 @@ export function git(
 	});
 	proc.on("error", reject);
 	proc.on("close", (code) => {
-		if (code === 0 || (code !== null && opts.okCodes?.includes(code))) {
-			resolve(stdout.replace(/\n$/, ""));
+		if (code === 0) {
+			resolve(opts.raw ? stdout : stdout.replace(/\n$/, ""));
 		} else {
 			reject(new Error(stderr.trim() || `git ${args[0]} failed (code ${code})`));
 		}
@@ -105,12 +112,91 @@ export function checkpointRef(sessionId: string, entryId: string): string {
 	return `${REF_BASE}/${refComponent(sessionId)}/${refComponent(entryId)}`;
 }
 
+// ============================================================================
+// Shadow repository
+// ============================================================================
+
+export interface ShadowRepo {
+	/** Bare git dir under the extension cache (all writes land here). */
+	gitDir: string;
+	/** The user's workspace root (files only; its .git is never written). */
+	workTree: string;
+	/** Per-session persistent index (incremental `add -A` across checkpoints). */
+	indexFile: string;
+}
+
+/**
+ * Open (or initialize) the shadow repository for a workspace. One shadow
+ * per workspace root — object store is shared across sessions for dedup;
+ * the index file is per-session to avoid concurrent-session races.
+ */
+export async function openShadow(
+	workTree: string,
+	sessionId: string,
+	cacheRoot: string = join(homedir(), ".omp", "agent", "cache", "omp-rewind"),
+): Promise<ShadowRepo> {
+	const key = createHash("sha256").update(workTree).digest("hex").slice(0, 16);
+	const gitDir = join(cacheRoot, key);
+	try {
+		await access(join(gitDir, "HEAD"));
+	} catch {
+		await mkdir(gitDir, { recursive: true });
+		await git(["init", "--bare", "--quiet", gitDir], cacheRoot);
+		await git(["config", "gc.auto", "0"], gitDir);
+	}
+	return {
+		gitDir,
+		workTree,
+		indexFile: join(gitDir, `index-${refComponent(sessionId)}`),
+	};
+}
+
+/** Run git against the shadow object store with the workspace as work-tree. */
+function shadowGit(
+	shadow: ShadowRepo,
+	args: string[],
+	opts: GitRunOptions = {},
+): Promise<string> {
+	return git(
+		["--git-dir", shadow.gitDir, "--work-tree", shadow.workTree, ...args],
+		shadow.workTree,
+		{
+			...opts,
+			env: { ...opts.env, GIT_INDEX_FILE: shadow.indexFile },
+		},
+	);
+}
+
+/**
+ * Sync the shadow index to the current workspace state and return the tree.
+ * `add -A` respects the workspace's .gitignore; a second force-add keeps
+ * files that the real repo tracks even when ignore rules match them.
+ */
+export async function syncShadowIndex(shadow: ShadowRepo): Promise<string> {
+	await shadowGit(shadow, ["add", "-A", "."]);
+	const tracked = await git(["ls-files", "-z"], shadow.workTree, {
+		raw: true,
+	}).catch(() => "");
+	if (tracked.length > 0) {
+		await shadowGit(
+			shadow,
+			["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"],
+			{ input: tracked },
+		);
+	}
+	return shadowGit(shadow, ["write-tree"]);
+}
+
+// ============================================================================
+// Checkpoint CRUD
+// ============================================================================
+
 interface RepoHead {
 	branch: string;
 	headSha: string;
 }
 
-/** Branch name + HEAD sha; handles unborn branches and detached HEAD. */
+/** Branch name + HEAD sha of the REAL repo (read-only). */
 async function readHead(root: string): Promise<RepoHead> {
 	const headSha = await git(["rev-parse", "HEAD"], root).catch(() => ZEROS);
 	const branch = await git(["rev-parse", "--abbrev-ref", "HEAD"], root).catch(
@@ -119,101 +205,95 @@ async function readHead(root: string): Promise<RepoHead> {
 	return { branch, headSha };
 }
 
-async function listUntracked(root: string): Promise<string[]> {
-	const out = await git(
-		["ls-files", "--others", "--exclude-standard", "-z"],
-		root,
-	).catch(() => "");
-	return out.split("\0").filter((p) => p.length > 0);
-}
-
 export interface CreateCheckpointOpts {
-	root: string;
+	shadow: ShadowRepo;
 	sessionId: string;
 	entryId: string;
 	label?: string;
 }
 
 /**
- * Snapshot the full workspace into a checkpoint ref bound to a session entry.
- * Never touches the real index: uses a temporary GIT_INDEX_FILE seeded from
- * HEAD, then a single `git add -A` (respects .gitignore, no path lists).
+ * Snapshot the full workspace into a shadow ref bound to a session entry.
+ * The workspace repo is only READ (HEAD, branch, staged diff, tracked list);
+ * every write goes to the shadow.
  */
 export async function createCheckpoint(
 	opts: CreateCheckpointOpts,
 ): Promise<CheckpointMeta> {
-	const { root, sessionId, entryId, label } = opts;
+	const { shadow, sessionId, entryId, label } = opts;
+	const root = shadow.workTree;
 	const createdAt = new Date().toISOString();
 	const { branch, headSha } = await readHead(root);
-	const indexTreeSha = await git(["write-tree"], root);
-	const untracked = await listUntracked(root);
 
-	const tmpDir = await mkdtemp(join(tmpdir(), "omp-rewind-"));
-	try {
-		const env = { GIT_INDEX_FILE: join(tmpDir, "index") };
-		if (headSha !== ZEROS) {
-			await git(["read-tree", headSha], root, { env });
-		}
-		await git(["add", "-A", "."], root, { env });
-		const worktreeTreeSha = await git(["write-tree"], root, { env });
+	const stagedPatch = await git(
+		["diff", "--cached", "--binary", "--full-index", "--no-ext-diff"],
+		root,
+		{ raw: true },
+	).catch(() => "");
+	const stagedPatchBlob =
+		stagedPatch.trim().length === 0
+			? null
+			: await shadowGit(shadow, ["hash-object", "-w", "--stdin"], {
+					input: stagedPatch,
+				});
 
-		const meta: CheckpointMeta = {
-			entryId,
-			sessionId,
-			branch,
-			headSha,
-			indexTreeSha,
-			worktreeTreeSha,
-			untracked,
-			createdAt,
-			label,
-		};
+	const worktreeTreeSha = await syncShadowIndex(shadow);
 
-		const message = `omp-rewind checkpoint\n\n${JSON.stringify(meta)}\n`;
-		const commitEnv = {
+	const meta: CheckpointMeta = {
+		entryId,
+		sessionId,
+		branch,
+		headSha,
+		worktreeTreeSha,
+		stagedPatchBlob,
+		createdAt,
+		label,
+	};
+
+	const commitSha = await shadowGit(shadow, ["commit-tree", worktreeTreeSha], {
+		input: `omp-rewind checkpoint\n\n${JSON.stringify(meta)}\n`,
+		env: {
 			GIT_AUTHOR_NAME: "omp-rewind",
 			GIT_AUTHOR_EMAIL: "rewind@omp",
 			GIT_COMMITTER_NAME: "omp-rewind",
 			GIT_COMMITTER_EMAIL: "rewind@omp",
 			GIT_AUTHOR_DATE: createdAt,
 			GIT_COMMITTER_DATE: createdAt,
-		};
-		const commitSha = await git(["commit-tree", worktreeTreeSha], root, {
-			input: message,
-			env: commitEnv,
-		});
-		await git(
-			["update-ref", checkpointRef(sessionId, entryId), commitSha],
-			root,
-		);
-		return meta;
-	} finally {
-		await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-	}
+		},
+	});
+	await shadowGit(shadow, [
+		"update-ref",
+		checkpointRef(sessionId, entryId),
+		commitSha,
+	]);
+	return meta;
 }
 
 /** Load checkpoint metadata for a session entry; null when absent/corrupt. */
 export async function loadCheckpoint(
-	root: string,
+	shadow: ShadowRepo,
 	sessionId: string,
 	entryId: string,
 ): Promise<CheckpointMeta | null> {
 	try {
 		const ref = checkpointRef(sessionId, entryId);
-		const commitSha = await git(["rev-parse", "--verify", ref], root);
-		const raw = await git(["cat-file", "commit", commitSha], root);
+		const commitSha = await shadowGit(shadow, ["rev-parse", "--verify", ref]);
+		const raw = await shadowGit(shadow, ["cat-file", "commit", commitSha]);
 		const bodyStart = raw.indexOf("\n\n");
 		if (bodyStart === -1) return null;
-		const body = raw.slice(bodyStart + 2);
-		const jsonStart = body.indexOf("{");
+		const jsonStart = raw.indexOf("{", bodyStart);
 		if (jsonStart === -1) return null;
-		const meta = JSON.parse(body.slice(jsonStart)) as CheckpointMeta;
-		if (!meta.worktreeTreeSha || !meta.indexTreeSha) return null;
+		const meta = JSON.parse(raw.slice(jsonStart)) as CheckpointMeta;
+		if (!meta.worktreeTreeSha) return null;
 		return meta;
 	} catch {
 		return null;
 	}
 }
+
+// ============================================================================
+// Restore
+// ============================================================================
 
 export type RestoreBlockReason = "branch-mismatch" | "detached-head-moved";
 
@@ -227,16 +307,28 @@ export class RestoreBlockedError extends Error {
 	}
 }
 
+export interface RestoreResult {
+	/**
+	 * False when the staged/unstaged split could not be reproduced (HEAD
+	 * moved since the checkpoint, so the staged patch no longer applies);
+	 * files are still restored, everything shows as unstaged changes.
+	 */
+	stagedRestored: boolean;
+}
+
 /**
- * Restore worktree + index to a checkpoint. HEAD and the branch pointer are
- * never modified; commits made after the checkpoint stay reachable.
+ * Restore worktree files + the workspace index split to a checkpoint.
+ * HEAD and the branch pointer are never modified; commits made after the
+ * checkpoint stay reachable. Cross-branch restores are blocked.
  *
- * Cross-branch restores are blocked (RestoreBlockedError).
+ * Ignored-but-untracked files never enter the shadow index, so they are
+ * invisible here and never deleted.
  */
 export async function restoreCheckpoint(
-	root: string,
+	shadow: ShadowRepo,
 	cp: CheckpointMeta,
-): Promise<void> {
+): Promise<RestoreResult> {
+	const root = shadow.workTree;
 	const { branch, headSha } = await readHead(root);
 	if (branch !== cp.branch) {
 		throw new RestoreBlockedError(
@@ -251,23 +343,42 @@ export async function restoreCheckpoint(
 		);
 	}
 
-	// 1. Worktree + index := snapshot tree (adds, updates, and removes files).
-	await git(["read-tree", "--reset", "-u", cp.worktreeTreeSha], root);
+	// 1. Shadow index := current disk state, then worktree := snapshot tree.
+	//    read-tree --reset -u adds, rewrites, and deletes files as needed
+	//    (files created after the checkpoint are in the synced index but not
+	//    in the target tree, so -u removes them).
+	await syncShadowIndex(shadow);
+	await shadowGit(shadow, ["read-tree", "--reset", "-u", cp.worktreeTreeSha]);
 
-	// 2. Delete untracked files that did not exist at checkpoint time.
-	//    (.gitignore'd files are invisible here and thus never deleted.)
-	const preexisting = new Set(cp.untracked);
-	const current = await listUntracked(root);
-	for (const rel of current) {
-		if (!preexisting.has(rel)) {
-			await rm(join(root, rel), { force: true }).catch(() => {});
+	// 2. Workspace index := HEAD, then replay the staged diff. This is the
+	//    single intentional write to the workspace repo — it IS the restore
+	//    of the staged/unstaged split the user had.
+	if (headSha === ZEROS) {
+		await git(["read-tree", "--empty"], root);
+	} else {
+		await git(["read-tree", "HEAD"], root);
+	}
+	let stagedRestored = true;
+	if (cp.stagedPatchBlob) {
+		const patch = await shadowGit(
+			shadow,
+			["cat-file", "blob", cp.stagedPatchBlob],
+			{ raw: true },
+		);
+		try {
+			await git(["apply", "--cached", "--whitespace=nowarn", "-"], root, {
+				input: patch,
+			});
+		} catch {
+			stagedRestored = false;
 		}
 	}
-
-	// 3. Index := snapshot index tree, without touching files. Restores the
-	//    staged/unstaged/untracked split exactly as it was.
-	await git(["read-tree", "--reset", cp.indexTreeSha], root);
+	return { stagedRestored };
 }
+
+// ============================================================================
+// Ref listing / pruning / diff
+// ============================================================================
 
 export interface RefListing {
 	sessionComponent: string;
@@ -275,11 +386,14 @@ export interface RefListing {
 	ref: string;
 }
 
-export async function listCheckpointRefs(root: string): Promise<RefListing[]> {
-	const out = await git(
-		["for-each-ref", "--format=%(refname)", `${REF_BASE}/`],
-		root,
-	).catch(() => "");
+export async function listCheckpointRefs(
+	shadow: ShadowRepo,
+): Promise<RefListing[]> {
+	const out = await shadowGit(shadow, [
+		"for-each-ref",
+		"--format=%(refname)",
+		`${REF_BASE}/`,
+	]).catch(() => "");
 	const listings: RefListing[] = [];
 	for (const ref of out.split("\n")) {
 		if (!ref.startsWith(`${REF_BASE}/`)) continue;
@@ -297,31 +411,35 @@ export async function listCheckpointRefs(root: string): Promise<RefListing[]> {
 
 /**
  * Delete checkpoint refs. `scope: "others"` keeps the given session,
- * `scope: "all"` wipes everything. Returns number deleted.
+ * `scope: "all"` wipes everything and garbage-collects the shadow.
+ * Returns number of refs deleted.
  */
 export async function pruneCheckpoints(
-	root: string,
+	shadow: ShadowRepo,
 	scope: "others" | "all",
 	currentSessionId: string,
 ): Promise<number> {
 	const keep = refComponent(currentSessionId);
-	const listings = await listCheckpointRefs(root);
+	const listings = await listCheckpointRefs(shadow);
 	let deleted = 0;
 	for (const { sessionComponent, ref } of listings) {
 		if (scope === "others" && sessionComponent === keep) continue;
-		await git(["update-ref", "-d", ref], root).catch(() => {});
+		await shadowGit(shadow, ["update-ref", "-d", ref]).catch(() => {});
 		deleted++;
+	}
+	if (scope === "all") {
+		await shadowGit(shadow, ["gc", "--prune=now", "--quiet"]).catch(() => {});
 	}
 	return deleted;
 }
 
 /** Count checkpoints belonging to a session (for the status footer). */
 export async function countSessionCheckpoints(
-	root: string,
+	shadow: ShadowRepo,
 	sessionId: string,
 ): Promise<number> {
 	const wanted = refComponent(sessionId);
-	const listings = await listCheckpointRefs(root);
+	const listings = await listCheckpointRefs(shadow);
 	let count = 0;
 	for (const { sessionComponent } of listings) {
 		if (sessionComponent === wanted) count++;
@@ -331,29 +449,16 @@ export async function countSessionCheckpoints(
 
 /** One-line stat summary between two trees ("" when identical). */
 export async function diffTreeStat(
-	root: string,
+	shadow: ShadowRepo,
 	fromTree: string,
 	toTree: string,
 ): Promise<string> {
 	if (fromTree === toTree) return "";
-	return git(
-		["diff-tree", "--stat", "--no-commit-id", fromTree, toTree],
-		root,
-	).catch(() => "");
-}
-
-/** Tree sha of the current workspace state (content-only comparison key). */
-export async function currentWorktreeTree(root: string): Promise<string> {
-	const tmpDir = await mkdtemp(join(tmpdir(), "omp-rewind-cmp-"));
-	try {
-		const env = { GIT_INDEX_FILE: join(tmpDir, "index") };
-		const headSha = await git(["rev-parse", "HEAD"], root).catch(() => ZEROS);
-		if (headSha !== ZEROS) {
-			await git(["read-tree", headSha], root, { env });
-		}
-		await git(["add", "-A", "."], root, { env });
-		return await git(["write-tree"], root, { env });
-	} finally {
-		await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-	}
+	return shadowGit(shadow, [
+		"diff-tree",
+		"--stat",
+		"--no-commit-id",
+		fromTree,
+		toTree,
+	]).catch(() => "");
 }

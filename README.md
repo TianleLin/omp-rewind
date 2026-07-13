@@ -4,19 +4,20 @@ Session-tree-bound git checkpoints for [OMP](https://github.com/can1357/oh-my-pi
 
 ## How it works
 
-- **Checkpoints**: before each agent turn and after each mutating tool call, the full workspace state (tracked + staged + non-ignored untracked files, HEAD metadata) is snapshotted via a temporary git index into a commit object at `refs/omp-rewind/<sessionId>/<entryId>`.
+All checkpoint data lives in a **shadow git repository** under `~/.omp/agent/cache/omp-rewind/<workspace-hash>/` whose work-tree points at your workspace. Your repo's own `.git` gains **no refs and no objects** — nothing for `git push --mirror`, GUIs, `git bundle`, or backups to pick up.
+
+- **Checkpoints**: before each agent turn and after each mutating tool call, the full workspace state (tracked + non-ignored untracked files, staged diff as a patch blob, HEAD metadata) is snapshotted through the shadow's persistent per-session index (incremental, no full rescan) into a commit at `refs/omp-rewind/<sessionId>/<entryId>` — in the shadow.
 - **Navigation**: `session_before_tree` resolves the target node to its effective new leaf (user messages → parent, matching OMP's own rule), finds the nearest self-or-ancestor checkpoint, shows a diff stat, and asks:
   - `Restore conversation + files` (default)
   - `Restore conversation only`
   - `Cancel`
-- **Restore**: worktree + index only. HEAD and the branch pointer are **never** moved — commits made after the checkpoint stay on your branch, and the restore shows up as uncommitted changes. Cross-branch restores are blocked.
+- **Restore**: worktree files + the staged/unstaged split. HEAD and the branch pointer are **never** moved — commits made after the checkpoint stay on your branch, and the restore shows up as uncommitted changes. Cross-branch restores are blocked. The only write to your repo's `.git` is the index update that reproduces your staged state (that write *is* the restore, and it happens only when you confirm one).
 - **Undo**: before restoring, the leaving state is checkpointed against the old leaf. Undo = double-Esc, navigate back to the node you came from. No extra commands, no redo stack.
-- **Safety**: gitignored files are invisible to snapshots and never deleted by restores. Untracked files that existed at checkpoint time are restored untracked (staged/unstaged split is preserved exactly).
+- **Safety**: gitignored files never enter snapshots and are never deleted by restores (tracked-but-ignored files are force-included). Untracked files that existed at checkpoint time come back untracked.
 
 ## Requirements
-
 - OMP with extension support
-- The workspace must be a git repository (the extension disables itself otherwise, with a notice)
+- `git` on PATH; the workspace must be a git repository (the extension disables itself otherwise, with a notice)
 
 ## Install
 
@@ -33,7 +34,7 @@ omp install /path/to/omp-rewind   # or: pi install …
 ## Commands
 
 - `/rewind-prune` — delete checkpoint refs from **other** sessions
-- `/rewind-prune all` — delete every omp-rewind ref including the current session
+- `/rewind-prune all` — delete every omp-rewind ref including the current session, then `gc` the shadow store
 
 Refs are never deleted automatically; old sessions keep working file restores after `/resume`.
 
