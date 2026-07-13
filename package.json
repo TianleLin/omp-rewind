@@ -1,0 +1,33 @@
+{
+	"name": "omp-rewind",
+	"version": "0.1.0",
+	"description": "Session-tree-bound git checkpoints for OMP: double-Esc tree navigation restores conversation and files together",
+	"license": "MIT",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"omp",
+		"pi-coding-agent",
+		"extension",
+		"rewind",
+		"checkpoint"
+	],
+	"files": [
+		"src/",
+		"README.md",
+		"LICENSE"
+	],
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"scripts": {
+		"check": "tsc --noEmit",
+		"test": "bun test"
+	},
+	"devDependencies": {
+		"@types/bun": "^1.2.0",
+		"typescript": "^5.7.0"
+	}
+}
