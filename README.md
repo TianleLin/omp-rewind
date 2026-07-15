@@ -48,12 +48,21 @@ Refs are never deleted automatically; old sessions keep working file restores af
 | Commits after checkpoint | Kept — restore only rewrites worktree + index |
 | Non-git directory | Extension disabled with a notice |
 
+## Subagents (`task` tool)
+
+- OMP re-imports extensions for every subagent child session; omp-rewind detects this via a process-global claim and stays **inert in child sessions** — only the main session writes checkpoints. (Verified e2e: a run that spawns a subagent produces refs in exactly one session namespace.)
+- A subagent's file changes land between two main-tree anchors (the `task` call and its result injection). Rewinding to the user turn that spawned it reverts **all** of its changes atomically; the leaving checkpoint keeps redo working.
+- Mid-subagent granularity does not exist by design — child sessions are not part of the main session tree. Use `isolated: true` tasks if you want subagent work to land atomically via patch/branch merge.
+- **Esc does not stop background subagents.** Esc only interrupts the main agent loop; background jobs keep running and keep writing files. Cancel them first (`job cancel <id>`, Agent Hub, or irc) before rewinding — the restore dialog reminds you whenever the session has spawned subagents.
+- Stop → undo → switch model → re-run: `job cancel` the subagent, double-Esc to the user turn that spawned it, restore conversation + files, edit the prompt (pick a different agent type — per-spawn model override is not part of the task schema), resubmit.
+
 ## Development
 
 ```bash
 bun install
-bun test          # git-backed contract tests
-bunx tsc --noEmit # typecheck
+bun test                  # git-backed contract tests
+bunx tsc --noEmit         # typecheck
+./tests/e2e-subagent.sh   # real-omp e2e: subagent runs stay out of the shadow store
 ```
 
 ## Design lineage

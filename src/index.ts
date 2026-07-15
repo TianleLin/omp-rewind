@@ -61,6 +61,8 @@ interface State {
 	/** Serializes checkpoint creation; restore waits for it. */
 	writing: Promise<void>;
 	busy: boolean;
+	/** This session spawned subagents — restore dialogs warn about races. */
+	sawTask: boolean;
 }
 
 function isUserish(entry: SessionEntryLike | undefined): boolean {
@@ -79,6 +81,7 @@ export default function (pi: PiApiLike) {
 		pending: null,
 		writing: Promise.resolve(),
 		busy: false,
+		sawTask: false,
 	};
 
 	const updateStatus = async (ctx: ExtensionContextLike): Promise<void> => {
@@ -192,9 +195,30 @@ export default function (pi: PiApiLike) {
 	// ========================================================================
 
 	pi.on("session_start", async (_event, ctx) => {
+		const sid = ctx.sessionManager.getSessionId();
+		// OMP re-imports this extension for every task subagent, so each child
+		// session runs its OWN copy (verified: same pid, fresh module instance
+		// per child). Without a gate every subagent would checkpoint its whole
+		// run into the shadow store under a session namespace no tree UI can
+		// ever reach — pure pollution plus ~100ms per mutating child tool.
+		//
+		// Discriminator: a process-global claim. The main session's instance
+		// always loads first (children can only be spawned from inside a main
+		// turn); an interactive instance (hasUI) may also take over the claim
+		// (e.g. /reload creating a fresh instance). Everyone else goes inert.
+		const registry = globalThis as Record<PropertyKey, unknown>;
+		const CLAIM = Symbol.for("omp-rewind.main-claim");
+		if (registry[CLAIM] === undefined || ctx.hasUI) {
+			registry[CLAIM] = state;
+		}
+		if (registry[CLAIM] !== state) {
+			state.shadow = null;
+			return;
+		}
+		state.sawTask = false;
 		state.pending = null;
 		state.busy = false;
-		state.sessionId = ctx.sessionManager.getSessionId();
+		state.sessionId = sid;
 		const root = await git(["rev-parse", "--show-toplevel"], ctx.cwd).catch(
 			() => "",
 		);
@@ -219,6 +243,7 @@ export default function (pi: PiApiLike) {
 
 	pi.on("before_agent_start", async (_event, ctx) => {
 		if (!state.shadow || state.busy) return;
+		if (ctx.sessionManager.getSessionId() !== state.sessionId) return;
 		await scheduleCheckpoint(ctx, currentLeafEntry(ctx), "turn-start");
 	});
 
@@ -226,8 +251,10 @@ export default function (pi: PiApiLike) {
 		"tool_execution_end",
 		async (event: { toolName?: string }, ctx: ExtensionContextLike) => {
 			if (!state.shadow || state.busy) return;
-			if (state.granularity === "turn") return;
+			if (ctx.sessionManager.getSessionId() !== state.sessionId) return;
 			const toolName = event.toolName ?? "";
+			if (toolName === "task") state.sawTask = true;
+			if (state.granularity === "turn") return;
 			if (READ_ONLY_TOOLS[toolName]) return;
 			const entryId = ctx.sessionManager.getEntries().at(-1)?.id;
 			if (!entryId) return;
@@ -250,6 +277,9 @@ export default function (pi: PiApiLike) {
 			if (!shadow || !ctx.hasUI) return undefined;
 
 			const targetId = event.targetId ?? event.preparation?.targetId;
+			if (ctx.sessionManager.getSessionId() !== state.sessionId) {
+				return undefined;
+			}
 			const oldLeafId =
 				event.oldLeafId !== undefined
 					? event.oldLeafId
@@ -315,6 +345,11 @@ export default function (pi: PiApiLike) {
 						: []),
 				);
 			}
+			if (state.sawTask) {
+				lines.push(
+					"⚠ This session spawned subagents. A background subagent that is still running keeps writing files after the restore — cancel it first (job cancel / Agent Hub).",
+				);
+			}
 
 			const choice = await ctx.ui.select(lines.join("\n"), [
 				"Restore conversation + files",
@@ -339,6 +374,7 @@ export default function (pi: PiApiLike) {
 			event: { newLeafId?: string | null },
 			ctx: ExtensionContextLike,
 		) => {
+			if (ctx.sessionManager.getSessionId() !== state.sessionId) return;
 			const pending = state.pending;
 			state.pending = null;
 			const shadow = state.shadow;
