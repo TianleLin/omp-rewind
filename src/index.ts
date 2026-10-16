@@ -42,10 +42,18 @@ import type {
 	SessionEntryLike,
 	TreePreparationLike,
 } from "./types.ts";
+import { clearPresence, writePresence } from "./presence.ts";
 
 const STATUS_KEY = "omp-rewind";
 /** Entry-ID stand-in for the empty tree (leaf = null). */
 const ROOT_ENTRY = "root";
+
+/** "just now" / "37s ago" / "5m ago" for presence dialog lines. */
+function formatAge(ms: number): string {
+	if (ms < 5_000) return "just now";
+	if (ms < 120_000) return `${Math.round(ms / 1000)}s ago`;
+	return `${Math.round(ms / 60_000)}m ago`;
+}
 
 interface PendingRestore {
 	mode: "all" | "conversation";
@@ -234,7 +242,29 @@ export default function (pi: PiApiLike) {
 			return;
 		}
 		state.shadow = await openShadow(root, state.sessionId);
+		await writePresence(state.shadow.gitDir, state.sessionId, false);
 		await updateStatus(ctx);
+	});
+
+	pi.on("session_shutdown", async () => {
+		if (state.shadow) await clearPresence(state.shadow.gitDir);
+	});
+
+	// ========================================================================
+	// Cross-process presence: advertise busy/idle so a second omp on this
+	// workspace can refuse to restore files while our agent is mid-turn.
+	// ========================================================================
+
+	pi.on("agent_start", async (_event, ctx: ExtensionContextLike) => {
+		if (!state.shadow) return;
+		if (ctx.sessionManager.getSessionId() !== state.sessionId) return;
+		await writePresence(state.shadow.gitDir, state.sessionId, true);
+	});
+
+	pi.on("agent_end", async (_event, ctx: ExtensionContextLike) => {
+		if (!state.shadow) return;
+		if (ctx.sessionManager.getSessionId() !== state.sessionId) return;
+		await writePresence(state.shadow.gitDir, state.sessionId, false);
 	});
 
 	// ========================================================================
@@ -252,6 +282,8 @@ export default function (pi: PiApiLike) {
 		async (event: { toolName?: string }, ctx: ExtensionContextLike) => {
 			if (!state.shadow || state.busy) return;
 			if (ctx.sessionManager.getSessionId() !== state.sessionId) return;
+			// Cross-process liveness: any tool completion proves we're mid-turn.
+			void writePresence(state.shadow.gitDir, state.sessionId, true);
 			const toolName = event.toolName ?? "";
 			if (toolName === "task") state.sawTask = true;
 			if (state.granularity === "turn") return;
@@ -382,6 +414,7 @@ export default function (pi: PiApiLike) {
 			if (pending.mode !== "all" || !pending.checkpoint) return;
 
 			state.busy = true;
+			await writePresence(shadow.gitDir, state.sessionId, true);
 			try {
 				await state.writing;
 				// Re-resolve from the authoritative new leaf; falls back to the
@@ -411,6 +444,7 @@ export default function (pi: PiApiLike) {
 				if (ctx.hasUI) ctx.ui.notify(message, "error");
 			} finally {
 				state.busy = false;
+				await writePresence(shadow.gitDir, state.sessionId, false);
 			}
 			await updateStatus(ctx);
 		},
