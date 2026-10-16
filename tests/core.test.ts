@@ -321,3 +321,69 @@ test("openShadow is idempotent and isolates per-session index files", async () =
 	expect(again.gitDir).toBe(shadow.gitDir);
 	expect(again.indexFile).not.toBe(shadow.indexFile);
 });
+
+
+// ============================================================================
+// git() runner + pathspec boundary contracts
+// ============================================================================
+test("inherited GIT_INDEX_FILE/GIT_DIR cannot retarget checkpoint git calls", async () => {
+	// A user shell exporting GIT_INDEX_FILE poisons every real-repo call
+	// (staged split reads/writes the wrong index) unless the runner strips
+	// repo-targeting vars it did not set itself.
+	const savedIndex = process.env.GIT_INDEX_FILE;
+	const savedDir = process.env.GIT_DIR;
+	process.env.GIT_INDEX_FILE = join(tmpdir(), "poisoned-index-does-not-exist");
+	process.env.GIT_DIR = join(tmpdir(), "poisoned-gitdir-does-not-exist");
+	try {
+		await writeFile(join(repo, "a.txt"), "staged half\n");
+		await git(["add", "a.txt"], repo);
+		await writeFile(join(repo, "a.txt"), "staged half\nunstaged half\n");
+
+		const cp = await createCheckpoint(opts("entry-1"));
+		expect(cp.stagedPatchBlob).not.toBeNull();
+
+		await git(["checkout", "--", "a.txt"], repo).catch(() => {});
+		await writeFile(join(repo, "a.txt"), "mutated\n");
+		const result = await restoreCheckpoint(shadow, cp);
+		expect(result.stagedRestored).toBe(true);
+		const staged = await git(["diff", "--cached", "--name-only"], repo);
+		expect(staged).toContain("a.txt");
+	} finally {
+		if (savedIndex === undefined) delete process.env.GIT_INDEX_FILE;
+		else process.env.GIT_INDEX_FILE = savedIndex;
+		if (savedDir === undefined) delete process.env.GIT_DIR;
+		else process.env.GIT_DIR = savedDir;
+	}
+});
+
+test("entry ids ending in a dot produce valid refs", async () => {
+	expect(refComponent("e.")).not.toMatch(/\.$/);
+	const cp = await createCheckpoint(opts("entry."));
+	const loaded = await loadCheckpoint(shadow, SESSION, "entry.");
+	expect(loaded?.worktreeTreeSha).toBe(cp.worktreeTreeSha);
+});
+
+test("large stdin to a fast-exiting git does not crash (EPIPE handled)", async () => {
+	// `git version` exits without reading stdin; the buffered 8 MiB write
+	// EPIPEs. Without a stdin error handler that is an uncaught stream error.
+	const out = await git(["version"], repo, { input: "x".repeat(8 * 1024 * 1024) });
+	expect(out).toContain("git version");
+});
+
+test("staged split with multibyte content survives pipe-chunked transport", async () => {
+	// 384 KiB of 3-byte chars: a 64 KiB pipe chunk boundary always splits a
+	// character. Per-chunk Buffer→string decoding corrupts the patch (U+FFFD),
+	// and the staged restore degrades or corrupts.
+	const big = "中".repeat(128 * 1024);
+	await writeFile(join(repo, "big.txt"), big);
+	await git(["add", "big.txt"], repo);
+
+	const cp = await createCheckpoint(opts("entry-1"));
+	expect(cp.stagedPatchBlob).not.toBeNull();
+
+	await git(["read-tree", "HEAD"], repo); // drop staged state
+	const result = await restoreCheckpoint(shadow, cp);
+	expect(result.stagedRestored).toBe(true);
+	const stagedBlob = await git(["show", ":big.txt"], repo, { raw: true });
+	expect(stagedBlob).toBe(big);
+});

@@ -63,36 +63,61 @@ export interface GitRunOptions {
 	raw?: boolean;
 }
 
-/** Run git with an args array (no shell, no quoting pitfalls). */
+/**
+ * Run git with an args array (no shell, no quoting pitfalls).
+ *
+ * Boundary contracts (each broke in the wild before being pinned here):
+ * - repo-targeting env vars inherited from the user's shell (GIT_DIR,
+ *   GIT_INDEX_FILE, …) are STRIPPED — a stray `export GIT_INDEX_FILE` must
+ *   not retarget checkpoint/restore plumbing. `opts.env` still wins.
+ * - stdout/stderr are accumulated as Buffers and decoded ONCE: per-chunk
+ *   `+=` decoding corrupts multibyte UTF-8 split across 64 KiB pipe chunks
+ *   (staged patches with non-ASCII content came back as U+FFFD soup).
+ * - stdin errors are swallowed: git may exit before draining its stdin
+ *   (e.g. `apply` rejecting a patch early), and the resulting EPIPE must
+ *   surface as the command's close/stderr, not as an uncaught stream error.
+ */
 export function git(
 	args: string[],
 	cwd: string,
 	opts: GitRunOptions = {},
 ): Promise<string> {
 	const { promise, resolve, reject } = Promise.withResolvers<string>();
+	const env: Record<string, string | undefined> = { ...process.env };
+	delete env.GIT_DIR;
+	delete env.GIT_WORK_TREE;
+	delete env.GIT_INDEX_FILE;
+	delete env.GIT_NAMESPACE;
+	delete env.GIT_OBJECT_DIRECTORY;
+	delete env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
 	const proc = spawn("git", args, {
 		cwd,
-		env: opts.env ? { ...process.env, ...opts.env } : process.env,
+		env: opts.env ? { ...env, ...opts.env } : env,
 		stdio: ["pipe", "pipe", "pipe"],
 	});
 
-	let stdout = "";
-	let stderr = "";
+	const stdout: Buffer[] = [];
+	const stderr: Buffer[] = [];
 	proc.stdout.on("data", (d: Buffer) => {
-		stdout += d;
+		stdout.push(d);
 	});
 	proc.stderr.on("data", (d: Buffer) => {
-		stderr += d;
+		stderr.push(d);
 	});
 	proc.on("error", reject);
 	proc.on("close", (code) => {
 		if (code === 0) {
-			resolve(opts.raw ? stdout : stdout.replace(/\n$/, ""));
+			const out = Buffer.concat(stdout).toString("utf-8");
+			resolve(opts.raw ? out : out.replace(/\n$/, ""));
 		} else {
-			reject(new Error(stderr.trim() || `git ${args[0]} failed (code ${code})`));
+			const err = Buffer.concat(stderr).toString("utf-8").trim();
+			reject(new Error(err || `git ${args[0]} failed (code ${code})`));
 		}
 	});
 
+	proc.stdin.on("error", () => {
+		// EPIPE when git exits without reading stdin — reported via close.
+	});
 	if (opts.input !== undefined) {
 		proc.stdin.write(opts.input);
 	}
@@ -103,8 +128,11 @@ export function git(
 /** Sanitize an ID for use as a git ref path component. */
 export function refComponent(id: string): string {
 	const cleaned = id.replace(/[^A-Za-z0-9._-]/g, "_");
-	// git refs may not start with "." or end with ".lock"
-	const safe = cleaned.replace(/^\.+/, "_").replace(/\.lock$/i, "_lock");
+	// git refs may not start or end with ".", nor end with ".lock"
+	const safe = cleaned
+		.replace(/^\.+/, "_")
+		.replace(/\.+$/, "_")
+		.replace(/\.lock$/i, "_lock");
 	return safe.length > 0 ? safe : "_";
 }
 
