@@ -12,16 +12,31 @@
  * `refs/omp-rewind/<session>/<entry>` in the shadow. Restore never moves
  * HEAD or the branch pointer; it rewrites worktree files and — as the one
  * intentional workspace-index write — reproduces the staged/unstaged split.
+ *
+ * FOLDER MODE: when the workspace is not a git repository, the same shadow
+ * machinery still snapshots and restores files. The staged split and branch
+ * guard degrade away (there is no workspace repo to read or write), and a
+ * default exclude list stands in for .gitignore.
  */
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, mkdir, rm } from "node:fs/promises";
+import {
+	access,
+	lstat,
+	mkdir,
+	readdir,
+	readFile,
+	rm,
+	writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 export const REF_BASE = "refs/omp-rewind";
 export const ZEROS = "0".repeat(40);
+/** Sentinel branch recorded for folder-mode checkpoints (no workspace repo). */
+export const NO_REPO_BRANCH = "(no-repo)";
 
 /**
  * Tools that never mutate the workspace. Anything NOT listed causes a
@@ -144,6 +159,29 @@ export function checkpointRef(sessionId: string, entryId: string): string {
 // Shadow repository
 // ============================================================================
 
+/**
+ * Folder mode has no .gitignore contract, so these keep node_modules-scale
+ * junk out of snapshots via the shadow's info/exclude (lowest precedence:
+ * a real .gitignore in the work-tree still overrides them).
+ */
+export const FOLDER_MODE_EXCLUDES = [
+	".git/",
+	"node_modules/",
+	"__pycache__/",
+	".venv/",
+	"venv/",
+	"dist/",
+	"build/",
+	"out/",
+	"target/",
+	".next/",
+	".nuxt/",
+	".turbo/",
+	".cache/",
+	".direnv/",
+	".DS_Store",
+];
+
 export interface ShadowRepo {
 	/** Bare git dir under the extension cache (all writes land here). */
 	gitDir: string;
@@ -151,18 +189,62 @@ export interface ShadowRepo {
 	workTree: string;
 	/** Per-session persistent index (incremental `add -A` across checkpoints). */
 	indexFile: string;
+	/** Workspace is a plain folder, not a git repo (folder mode). */
+	noRepo: boolean;
+	/**
+	 * Repo mode: path of the REAL repo's $GIT_DIR/info/exclude. The shadow
+	 * runs `add -A` with ITS OWN GIT_DIR, so this file is invisible to it
+	 * and must be mirrored into the shadow's info/exclude before every
+	 * index sync — otherwise a file ignored only there enters the snapshot,
+	 * and restoring an older checkpoint DELETES it from disk.
+	 */
+	realInfoExclude: string | null;
+}
+
+export interface OpenShadowOptions {
+	cacheRoot?: string;
+	/** The workspace is not a git repository — open in folder mode. */
+	noRepo?: boolean;
+}
+
+/**
+ * Mirror the one same-slot ignore source the shadow cannot see into the
+ * shadow's info/exclude: folder mode → FOLDER_MODE_EXCLUDES; repo mode →
+ * the REAL repo's info/exclude content (same precedence slot, so negation
+ * semantics are preserved). core.excludesFile is NOT merged here — it
+ * lives in a lower-precedence slot and is forwarded per-add via
+ * `-c core.excludesFile=…` (see syncShadowIndex).
+ */
+export async function refreshShadowExcludes(shadow: ShadowRepo): Promise<void> {
+	const content = shadow.noRepo
+		? `${FOLDER_MODE_EXCLUDES.join("\n")}\n`
+		: shadow.realInfoExclude
+			? await readFile(shadow.realInfoExclude, "utf-8").catch(() => "")
+			: "";
+	await writeFile(join(shadow.gitDir, "info", "exclude"), content);
 }
 
 /**
  * Open (or initialize) the shadow repository for a workspace. One shadow
  * per workspace root — object store is shared across sessions for dedup;
  * the index file is per-session to avoid concurrent-session races.
+ *
+ * The shadow's info/exclude is rewritten on every open AND before every
+ * index sync (see refreshShadowExcludes): folder mode seeds
+ * FOLDER_MODE_EXCLUDES; repo mode mirrors the real repo's info/exclude +
+ * resolved core.excludesFile (the two ignore sources a shadow GIT_DIR can
+ * never see; worktree .gitignore files and the global XDG excludes work
+ * through the work-tree / HOME as usual).
  */
 export async function openShadow(
 	workTree: string,
 	sessionId: string,
-	cacheRoot: string = join(homedir(), ".omp", "agent", "cache", "omp-rewind"),
+	options: OpenShadowOptions = {},
 ): Promise<ShadowRepo> {
+	const cacheRoot =
+		options.cacheRoot ??
+		join(homedir(), ".omp", "agent", "cache", "omp-rewind");
+	const noRepo = options.noRepo ?? false;
 	const key = createHash("sha256").update(workTree).digest("hex").slice(0, 16);
 	const gitDir = join(cacheRoot, key);
 	try {
@@ -172,11 +254,54 @@ export async function openShadow(
 		await git(["init", "--bare", "--quiet", gitDir], cacheRoot);
 		await git(["config", "gc.auto", "0"], gitDir);
 	}
-	return {
+	await mkdir(join(gitDir, "info"), { recursive: true });
+
+	let realInfoExclude: string | null = null;
+	if (!noRepo) {
+		const realGitDir = await git(
+			["rev-parse", "--absolute-git-dir"],
+			workTree,
+		).catch(() => "");
+		if (realGitDir.length > 0) {
+			realInfoExclude = join(realGitDir, "info", "exclude");
+		}
+	}
+
+	// Self-heal shadows poisoned by pre-fix `prune all` (gc --prune=now used
+	// to run while index files survived, leaving them pointing at deleted
+	// blobs; write-tree does not validate object existence). Scope: THIS
+	// session only — check OUR ref prefix, drop OUR index. A global zero-ref
+	// check would let another session's refs mask a poisoned index here
+	// (B checkpoints after the bad prune → resume A → global refs non-empty
+	// → A keeps publishing dead-blob trees). Foreign indexes are never
+	// touched: their session may be mid-checkpoint (deleting its index
+	// yields an EMPTY-tree checkpoint — restoring that wipes a worktree);
+	// stale ones die at their own session's next openShadow, like this one.
+	// Index files are per (session, PROCESS): two omp processes can /resume
+	// the SAME sessionId, and a shared index file would reintroduce the
+	// rm-during-peer-write → empty-tree hazard. Per-pid isolation costs one
+	// full re-hash per process start; no cross-process file is ever shared.
+	const sessionIndex = join(
+		gitDir,
+		`index-${refComponent(sessionId)}-${process.pid}`,
+	);
+	const ownRef = await git(
+		["--git-dir", gitDir, "for-each-ref", "--count=1", "--format=x",
+			`${REF_BASE}/${refComponent(sessionId)}/`],
+		cacheRoot,
+	).catch(() => "");
+	if (ownRef.length === 0) {
+		await rm(sessionIndex, { force: true }).catch(() => {});
+	}
+	const shadow: ShadowRepo = {
 		gitDir,
 		workTree,
-		indexFile: join(gitDir, `index-${refComponent(sessionId)}`),
+		indexFile: sessionIndex,
+		noRepo,
+		realInfoExclude,
 	};
+	await refreshShadowExcludes(shadow);
+	return shadow;
 }
 
 /** Run git against the shadow object store with the workspace as work-tree. */
@@ -195,24 +320,142 @@ function shadowGit(
 	);
 }
 
+/** `-c core.excludesFile=<effective>` for shadow commands (repo mode). */
+async function excludesFileConfig(shadow: ShadowRepo): Promise<string[]> {
+	if (shadow.noRepo) return [];
+	const excludesFile = await git(
+		["config", "--path", "--get", "core.excludesFile"],
+		shadow.workTree,
+	).catch(() => "");
+	return excludesFile.length > 0
+		? ["-c", `core.excludesFile=${excludesFile}`]
+		: [];
+}
+
 /**
  * Sync the shadow index to the current workspace state and return the tree.
- * `add -A` respects the workspace's .gitignore; a second force-add keeps
- * files that the real repo tracks even when ignore rules match them.
+ *
+ * Ignore contract (all four sources, live-refreshed every sync):
+ * 1. `add -A` respects worktree .gitignore + mirrored info/exclude +
+ *    forwarded core.excludesFile (-c, native precedence slot).
+ * 2. EVICTION: git never applies ignore rules to already-tracked paths, and
+ *    the shadow index is persistent — a file snapshotted BEFORE an ignore
+ *    rule appeared stays tracked forever, and restoring an older checkpoint
+ *    would DELETE it from disk. So every sync evicts shadow-tracked paths
+ *    that are now ignored — unless the REAL repo tracks them (those are the
+ *    legitimate tracked+ignored set, force-added below).
+ * 3. FORCE-ADD: files the REAL repo tracks that ignore rules hide from
+ *    `add -A` — filtered to paths on disk (`add` fatals on pathspecs
+ *    matching nothing; deleted-but-tracked deletions are already staged).
+ *
+ * Eviction failures THROW: a checkpoint that might still contain
+ * newly-ignored files is a data-loss hazard on restore, better no
+ * checkpoint (visible ⚠) than a poisoned one.
  */
 export async function syncShadowIndex(shadow: ShadowRepo): Promise<string> {
-	await shadowGit(shadow, ["add", "-A", "."]);
-	const tracked = await git(["ls-files", "-z"], shadow.workTree, {
-		raw: true,
-	}).catch(() => "");
-	if (tracked.length > 0) {
-		await shadowGit(
-			shadow,
-			["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"],
-			{ input: tracked },
-		);
+	await refreshShadowExcludes(shadow);
+	const addConfig = await excludesFileConfig(shadow);
+	await shadowGit(shadow, [...addConfig, "add", "-A", "."]);
+
+	// Real repo's tracked+ignored set (empty in folder mode).
+	const realTrackedIgnored = new Set<string>();
+	if (!shadow.noRepo) {
+		const raw = await git(
+			["ls-files", "-ci", "--exclude-standard", "-z"],
+			shadow.workTree,
+			{ raw: true },
+		).catch(() => "");
+		for (const path of raw.split("\0")) {
+			if (path.length > 0) realTrackedIgnored.add(path);
+		}
+	}
+
+	// 2. Evict shadow-tracked paths that current rules ignore (late-ignored
+	//    files), keeping the real repo's tracked+ignored ones.
+	const shadowIgnored = await shadowGit(
+		shadow,
+		[...addConfig, "ls-files", "-ciz", "--exclude-standard"],
+		{ raw: true },
+	);
+	const evict: string[] = [];
+	for (const path of shadowIgnored.split("\0")) {
+		if (path.length > 0 && !realTrackedIgnored.has(path)) evict.push(path);
+	}
+	if (evict.length > 0) {
+		await shadowGit(shadow, ["update-index", "--force-remove", "-z", "--stdin"], {
+			input: `${evict.join("\0")}\0`,
+		});
+	}
+
+	// 3. Force-add the real tracked+ignored set (only what exists on disk).
+	if (realTrackedIgnored.size > 0) {
+		const present: string[] = [];
+		for (const path of realTrackedIgnored) {
+			try {
+				await lstat(join(shadow.workTree, path));
+				present.push(path);
+			} catch {
+				// deleted from disk — add -A already recorded the deletion
+			}
+		}
+		if (present.length > 0) {
+			// --literal-pathspecs: ls-files output is literal paths; without it
+			// a ":"-prefixed name parses as pathspec magic and fatals the batch.
+			await shadowGit(
+				shadow,
+				[
+					"--literal-pathspecs",
+					"add",
+					"-f",
+					"--pathspec-from-file=-",
+					"--pathspec-file-nul",
+				],
+				{ input: `${present.join("\0")}\0` },
+			).catch(() => {
+				// best-effort: a racing delete must not kill the checkpoint
+			});
+		}
 	}
 	return shadowGit(shadow, ["write-tree"]);
+}
+
+/**
+ * Nested-repo paths recorded as gitlinks (mode 160000) in the session
+ * index. `add -A` hard-stops at embedded `.git` boundaries: their CONTENT
+ * is neither snapshotted nor restored (each nested repo is its own rewind
+ * domain — run omp inside it for full coverage). Callers surface this so
+ * folder mode never silently claims coverage it does not have.
+ */
+export async function listGitlinks(shadow: ShadowRepo): Promise<string[]> {
+	const out = await shadowGit(shadow, ["ls-files", "-sz"], {
+		raw: true,
+	}).catch(() => "");
+	const links: string[] = [];
+	for (const entry of out.split("\0")) {
+		if (entry.startsWith("160000 ")) {
+			const tab = entry.indexOf("\t");
+			if (tab !== -1) links.push(entry.slice(tab + 1));
+		}
+	}
+	return links;
+}
+
+/** Gitlink paths recorded in a checkpoint TREE (mode 160000 entries). */
+export async function listTreeGitlinks(
+	shadow: ShadowRepo,
+	treeSha: string,
+): Promise<string[]> {
+	const out = await shadowGit(shadow, ["ls-tree", "-rz", treeSha], {
+		raw: true,
+	}).catch(() => "");
+	const links: string[] = [];
+	for (const entry of out.split("\0")) {
+		if (entry.startsWith("160000 ")) {
+			const tab = entry.indexOf("\t");
+			if (tab !== -1) links.push(entry.slice(tab + 1));
+		}
+	}
+	return links;
 }
 
 // ============================================================================
@@ -224,8 +467,9 @@ interface RepoHead {
 	headSha: string;
 }
 
-/** Branch name + HEAD sha of the REAL repo (read-only). */
-async function readHead(root: string): Promise<RepoHead> {
+/** Branch name + HEAD sha of the REAL repo (read-only; sentinel in folder mode). */
+async function readHead(root: string, noRepo: boolean): Promise<RepoHead> {
+	if (noRepo) return { branch: NO_REPO_BRANCH, headSha: ZEROS };
 	const headSha = await git(["rev-parse", "HEAD"], root).catch(() => ZEROS);
 	const branch = await git(["rev-parse", "--abbrev-ref", "HEAD"], root).catch(
 		() => "unborn",
@@ -251,13 +495,15 @@ export async function createCheckpoint(
 	const { shadow, sessionId, entryId, label } = opts;
 	const root = shadow.workTree;
 	const createdAt = new Date().toISOString();
-	const { branch, headSha } = await readHead(root);
+	const { branch, headSha } = await readHead(root, shadow.noRepo);
 
-	const stagedPatch = await git(
-		["diff", "--cached", "--binary", "--full-index", "--no-ext-diff"],
-		root,
-		{ raw: true },
-	).catch(() => "");
+	const stagedPatch = shadow.noRepo
+		? ""
+		: await git(
+				["diff", "--cached", "--binary", "--full-index", "--no-ext-diff"],
+				root,
+				{ raw: true },
+			).catch(() => "");
 	const stagedPatchBlob =
 		stagedPatch.trim().length === 0
 			? null
@@ -323,7 +569,10 @@ export async function loadCheckpoint(
 // Restore
 // ============================================================================
 
-export type RestoreBlockReason = "branch-mismatch" | "detached-head-moved";
+export type RestoreBlockReason =
+	| "branch-mismatch"
+	| "detached-head-moved"
+	| "nested-repos";
 
 export class RestoreBlockedError extends Error {
 	constructor(
@@ -357,12 +606,15 @@ export async function restoreCheckpoint(
 	cp: CheckpointMeta,
 ): Promise<RestoreResult> {
 	const root = shadow.workTree;
-	const { branch, headSha } = await readHead(root);
+	const { branch, headSha } = await readHead(root, shadow.noRepo);
 	if (branch !== cp.branch) {
-		throw new RestoreBlockedError(
-			"branch-mismatch",
-			`Checkpoint was taken on "${cp.branch}" but you are on "${branch}". Switch back to "${cp.branch}" to restore files.`,
-		);
+		const detail =
+			cp.branch === NO_REPO_BRANCH
+				? "Checkpoint predates this git repository (it was taken when the workspace was a plain folder); file restore would fight the new repo state."
+				: shadow.noRepo
+					? `Checkpoint was taken on branch "${cp.branch}" but the workspace is no longer a git repository.`
+					: `Checkpoint was taken on "${cp.branch}" but you are on "${branch}". Switch back to "${cp.branch}" to restore files.`;
+		throw new RestoreBlockedError("branch-mismatch", detail);
 	}
 	if (branch === "HEAD" && headSha !== cp.headSha) {
 		throw new RestoreBlockedError(
@@ -376,11 +628,95 @@ export async function restoreCheckpoint(
 	//    (files created after the checkpoint are in the synced index but not
 	//    in the target tree, so -u removes them).
 	await syncShadowIndex(shadow);
-	await shadowGit(shadow, ["read-tree", "--reset", "-u", cp.worktreeTreeSha]);
+
+	// Embedded repos: gitlinks carry NO content — neither the checkpoint nor
+	// the synced index covers the files inside. Guard on current index ∪
+	// TARGET TREE (a child present at checkpoint time but since replaced by
+	// a plain directory leaves no gitlink in a fresh index, yet applying the
+	// gitlink-bearing target tree would delete the replacement's content).
+	// Repo mode: gitlinks the REAL repo tracks as 160000 are legitimate
+	// submodules — git-native pointer semantics, no block; everything else
+	// (untracked embedded repo) is exactly the folder-mode hazard.
+	const foreign = new Set<string>([
+		...(await listGitlinks(shadow)),
+		...(await listTreeGitlinks(shadow, cp.worktreeTreeSha)),
+	]);
+	if (!shadow.noRepo && foreign.size > 0) {
+		const raw = await git(["ls-files", "-sz"], root, { raw: true }).catch(
+			() => "",
+		);
+		for (const entry of raw.split("\0")) {
+			if (entry.startsWith("160000 ")) {
+				const tab = entry.indexOf("\t");
+				if (tab !== -1) foreign.delete(entry.slice(tab + 1));
+			}
+		}
+	}
+	if (foreign.size > 0) {
+		const shown = [...foreign];
+		throw new RestoreBlockedError(
+			"nested-repos",
+			`Nested git repositories are involved (${shown.slice(0, 3).join(", ")}${foreign.size > 3 ? ", …" : ""}) — in the workspace now, in the target checkpoint, or both — and the outer repo does not track them as submodules. Their files are not covered by checkpoints, so a file restore would be silently partial or destructive. Run omp inside each nested repo for full-fidelity rewind there.`,
+		);
+	}
+
+	// Currently-ignored paths are outside rewind's jurisdiction in BOTH
+	// directions: eviction (syncShadowIndex) stops deletes, and this strip
+	// stops WRITES — a checkpoint that captured the path while it was still
+	// snapshot-scoped must not clobber (or resurrect) it now. Paths the REAL
+	// repo tracks stay restorable (the legitimate tracked+ignored set).
+	const targetPaths = await shadowGit(
+		shadow,
+		["ls-tree", "-r", "--name-only", "-z", cp.worktreeTreeSha],
+		{ raw: true },
+	);
+	const config = await excludesFileConfig(shadow);
+	const ignoredNow = await shadowGit(
+		shadow,
+		[...config, "check-ignore", "-z", "--stdin"],
+		{ input: targetPaths, raw: true },
+	).catch(() => ""); // exit 1 = none ignored
+	const realTracked = new Set<string>();
+	if (!shadow.noRepo) {
+		const raw = await git(["ls-files", "-z"], root, { raw: true }).catch(
+			() => "",
+		);
+		for (const path of raw.split("\0")) {
+			if (path.length > 0) realTracked.add(path);
+		}
+	}
+	const strip = ignoredNow
+		.split("\0")
+		.filter((path) => path.length > 0 && !realTracked.has(path));
+
+	let applyTree = cp.worktreeTreeSha;
+	if (strip.length > 0) {
+		// Build a filtered tree in a throwaway index; the session index is
+		// untouched until the real read-tree below.
+		const tmpIndex = join(shadow.gitDir, `restore-tmp-${process.pid}`);
+		const tmpGit = (args: string[], opts: GitRunOptions = {}) =>
+			git(
+				["--git-dir", shadow.gitDir, "--work-tree", shadow.workTree, ...args],
+				shadow.workTree,
+				{ ...opts, env: { ...opts.env, GIT_INDEX_FILE: tmpIndex } },
+			);
+		try {
+			await tmpGit(["read-tree", cp.worktreeTreeSha]);
+			await tmpGit(["update-index", "--force-remove", "-z", "--stdin"], {
+				input: `${strip.join("\0")}\0`,
+			});
+			applyTree = await tmpGit(["write-tree"]);
+		} finally {
+			await rm(tmpIndex, { force: true }).catch(() => {});
+		}
+	}
+	await shadowGit(shadow, ["read-tree", "--reset", "-u", applyTree]);
 
 	// 2. Workspace index := HEAD, then replay the staged diff. This is the
 	//    single intentional write to the workspace repo — it IS the restore
-	//    of the staged/unstaged split the user had.
+	//    of the staged/unstaged split the user had. Folder mode has no
+	//    workspace repo, so there is nothing to reproduce.
+	if (shadow.noRepo) return { stagedRestored: true };
 	if (headSha === ZEROS) {
 		await git(["read-tree", "--empty"], root);
 	} else {
@@ -400,6 +736,31 @@ export async function restoreCheckpoint(
 		} catch {
 			stagedRestored = false;
 		}
+	}
+	// The jurisdiction rule must hold for the REAL index too: read-tree HEAD
+	// or the replayed staged patch can re-insert currently-ignored paths.
+	// The cleanup set is derived from the LIVE index — NOT from the target
+	// tree (`strip`): a path can be absent from the checkpoint tree yet
+	// re-inserted here (HEAD commits it, worktree deletion unstaged at
+	// checkpoint time, evicted via rm --cached before restore). Cleanup =
+	// (tracked∩ignored NOW, via the real repo's own full ignore stack) −
+	// (tracked BEFORE any real-index write): late-inserted ignored paths
+	// go, pre-existing legitimate tracked+ignored files stay. check-ignore
+	// is deliberately NOT used — it suppresses tracked paths by default,
+	// and these paths are tracked again by now. Failures throw (a silently
+	// poisoned index defeats the whole rule).
+	const postTrackedIgnored = await git(
+		["ls-files", "-ciz", "--exclude-standard"],
+		root,
+		{ raw: true },
+	);
+	const evict = postTrackedIgnored
+		.split("\0")
+		.filter((path) => path.length > 0 && !realTracked.has(path));
+	if (evict.length > 0) {
+		await git(["update-index", "--force-remove", "-z", "--stdin"], root, {
+			input: `${evict.join("\0")}\0`,
+		});
 	}
 	return { stagedRestored };
 }
