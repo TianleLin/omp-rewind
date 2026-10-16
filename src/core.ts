@@ -16,7 +16,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, mkdir } from "node:fs/promises";
+import { access, mkdir, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -437,28 +437,148 @@ export async function listCheckpointRefs(
 	return listings;
 }
 
+export interface PruneResult {
+	/** Refs actually deleted (update-ref -d succeeded). */
+	deleted: number;
+	/** Refs that matched the scope but failed to delete. */
+	failed: number;
+	/** `all` only: every per-session index file was removed. */
+	indexCleanupOk: boolean;
+	/** `all` only: gc ran and succeeded (skipped when cleanup failed). */
+	gcOk: boolean;
+}
+
+/** Prune target: fixed scopes, or keep-newest-N of the current session. */
+export type PruneScope =
+	| "current"
+	| "others"
+	| "all"
+	| { keep: number };
+
 /**
- * Delete checkpoint refs. `scope: "others"` keeps the given session,
- * `scope: "all"` wipes everything and garbage-collects the shadow.
- * Returns number of refs deleted.
+ * Delete checkpoint refs. `scope: "current"` deletes only this session's,
+ * `scope: "others"` keeps this session and deletes the rest, `scope: "all"`
+ * wipes everything (and repacks; objects are never pruned — see below),
+ * `{ keep: N }` keeps the current session's N NEWEST checkpoints (by
+ * committer date) and deletes its older ones — for "clear what I'll never
+ * rewind to" without losing recent restore points.
+ *
+ * Failures are COUNTED, never silently folded into success: the caller's
+ * "pruned N" claim must match what actually happened.
  */
 export async function pruneCheckpoints(
 	shadow: ShadowRepo,
-	scope: "others" | "all",
+	scope: PruneScope,
 	currentSessionId: string,
-): Promise<number> {
-	const keep = refComponent(currentSessionId);
-	const listings = await listCheckpointRefs(shadow);
+): Promise<PruneResult> {
+	const session = refComponent(currentSessionId);
+	let targets: string[];
+	if (typeof scope === "object") {
+		// Newest-first by CheckpointMeta.createdAt (millisecond ISO in the
+		// commit message) — NOT committerdate: git stores seconds only, so
+		// rapid checkpoints tie and the order would be undefined exactly
+		// where it matters. Ref name breaks residual ties deterministically.
+		const pairs = await shadowGit(shadow, [
+			"for-each-ref",
+			"--format=%(refname)%09%(objectname)",
+			`${REF_BASE}/${session}/`,
+		]).catch(() => "");
+		const refBySha = new Map<string, string[]>();
+		for (const line of pairs.split("\n")) {
+			const [ref, sha] = line.split("\t");
+			if (!ref || !sha) continue;
+			const list = refBySha.get(sha) ?? [];
+			list.push(ref);
+			refBySha.set(sha, list);
+		}
+		// One batch process for all commit bodies; createdAt per sha.
+		const batch = await shadowGit(shadow, ["cat-file", "--batch"], {
+			input: `${[...refBySha.keys()].join("\n")}\n`,
+			raw: true,
+		}).catch(() => "");
+		const createdBySha = new Map<string, string>();
+		let currentSha = "";
+		for (const line of batch.split("\n")) {
+			const header = /^([0-9a-f]{40,64}) commit \d+$/.exec(line);
+			if (header?.[1]) {
+				currentSha = header[1];
+				continue;
+			}
+			if (currentSha && line.startsWith("{")) {
+				try {
+					const meta = JSON.parse(line) as CheckpointMeta;
+					if (meta.createdAt) createdBySha.set(currentSha, meta.createdAt);
+				} catch {
+					// unreadable meta → sha stays absent → ref is KEPT (below)
+				}
+			}
+		}
+		// Fail-closed ordering: only refs whose createdAt is READABLE compete
+		// for deletion. Unknown-age refs are always kept (survivors may
+		// exceed N) — deleting what we cannot order would be arbitrary, and
+		// a failed batch read must degrade to a no-op, not a purge.
+		const entries: { ref: string; createdAt: string }[] = [];
+		for (const [sha, refs] of refBySha) {
+			const createdAt = createdBySha.get(sha);
+			if (createdAt === undefined) continue;
+			for (const ref of refs) entries.push({ ref, createdAt });
+		}
+		entries.sort((a, b) =>
+			a.createdAt === b.createdAt
+				? b.ref.localeCompare(a.ref)
+				: b.createdAt.localeCompare(a.createdAt),
+		);
+		targets = entries.slice(Math.max(0, scope.keep)).map((e) => e.ref);
+	} else {
+		targets = (await listCheckpointRefs(shadow))
+			.filter(({ sessionComponent }) =>
+				scope === "others"
+					? sessionComponent !== session
+					: scope === "current"
+						? sessionComponent === session
+						: true,
+			)
+			.map(({ ref }) => ref);
+	}
 	let deleted = 0;
-	for (const { sessionComponent, ref } of listings) {
-		if (scope === "others" && sessionComponent === keep) continue;
-		await shadowGit(shadow, ["update-ref", "-d", ref]).catch(() => {});
-		deleted++;
+	let failed = 0;
+	for (const ref of targets) {
+		const ok = await shadowGit(shadow, ["update-ref", "-d", ref]).then(
+			() => true,
+			() => false,
+		);
+		if (ok) deleted++;
+		else failed++;
 	}
+	let indexCleanupOk = true;
+	let gcOk = true;
 	if (scope === "all") {
-		await shadowGit(shadow, ["gc", "--prune=now", "--quiet"]).catch(() => {});
+		// Cross-process safety WITHOUT a lock (presence checks are UX, not a
+		// sync primitive — a peer can appear between check and gc):
+		// - NO object pruning, ever: a peer's persistent index may reference
+		//   blobs of ANY age kept alive only by that index (gc cannot see our
+		//   index files as roots), and any prune window poisons its next
+		//   checkpoint. `gc --no-prune` (the documented "never delete loose
+		//   objects" contract) repacks reachable objects and keeps the rest;
+		//   true disk reclaim needs an exclusive cross-process lock — future
+		//   work.
+		// - delete ONLY OUR OWN index file (we are quiesced by the caller);
+		//   other sessions' indexes are theirs — deleting one mid-checkpoint
+		//   makes write-tree read a MISSING index and emit an EMPTY tree
+		//   (restoring that wipes a worktree).
+		try {
+			await rm(shadow.indexFile, { force: true });
+		} catch {
+			indexCleanupOk = false;
+		}
+		gcOk = indexCleanupOk
+			? await shadowGit(shadow, ["gc", "--no-prune", "--quiet"]).then(
+					() => true,
+					() => false,
+				)
+			: false;
 	}
-	return deleted;
+	return { deleted, failed, indexCleanupOk, gcOk };
 }
 
 /** Count checkpoints belonging to a session (for the status footer). */

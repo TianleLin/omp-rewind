@@ -257,7 +257,7 @@ test("second checkpoint on the same entry overwrites the ref", async () => {
 	expect(loaded!.worktreeTreeSha).toBe(cp2.worktreeTreeSha);
 });
 
-test("prune others keeps current session, prune all wipes", async () => {
+test("prune scopes: current deletes only this session; others keeps it; all wipes", async () => {
 	await createCheckpoint(opts("entry-1"));
 	await createCheckpoint({
 		shadow,
@@ -265,14 +265,38 @@ test("prune others keeps current session, prune all wipes", async () => {
 		entryId: "entry-9",
 	});
 
-	const deletedOthers = await pruneCheckpoints(shadow, "others", SESSION);
-	expect(deletedOthers).toBe(1);
+	// current: only this session's ref goes; the other session survives
+	const resultCurrent = await pruneCheckpoints(shadow, "current", SESSION);
+	expect(resultCurrent).toEqual({
+		deleted: 1,
+		failed: 0,
+		indexCleanupOk: true,
+		gcOk: true,
+	});
 	let refs = await listCheckpointRefs(shadow);
+	expect(refs.length).toBe(1);
+	expect(refs[0]!.sessionComponent).toBe("other-session");
+
+	// re-create ours, then others: the other session goes, ours survives
+	await createCheckpoint(opts("entry-1"));
+	const resultOthers = await pruneCheckpoints(shadow, "others", SESSION);
+	expect(resultOthers).toEqual({
+		deleted: 1,
+		failed: 0,
+		indexCleanupOk: true,
+		gcOk: true,
+	});
+	refs = await listCheckpointRefs(shadow);
 	expect(refs.length).toBe(1);
 	expect(refs[0]!.ref).toBe(checkpointRef(SESSION, "entry-1"));
 
-	const deletedAll = await pruneCheckpoints(shadow, "all", SESSION);
-	expect(deletedAll).toBe(1);
+	const resultAll = await pruneCheckpoints(shadow, "all", SESSION);
+	expect(resultAll).toEqual({
+		deleted: 1,
+		failed: 0,
+		indexCleanupOk: true,
+		gcOk: true,
+	});
 	refs = await listCheckpointRefs(shadow);
 	expect(refs.length).toBe(0);
 });
@@ -386,4 +410,77 @@ test("staged split with multibyte content survives pipe-chunked transport", asyn
 	expect(result.stagedRestored).toBe(true);
 	const stagedBlob = await git(["show", ":big.txt"], repo, { raw: true });
 	expect(stagedBlob).toBe(big);
+});
+
+test("prune all never deletes unreachable objects (no-lock contract)", async () => {
+	await createCheckpoint(opts("entry-1"));
+	// an unreachable loose blob — stand-in for a peer's in-flight write
+	const blob = await git(
+		["--git-dir", shadow.gitDir, "hash-object", "-w", "--stdin"],
+		repo,
+		{ input: "peer-in-flight\n" },
+	);
+	const result = await pruneCheckpoints(shadow, "all", SESSION);
+	expect(result.gcOk).toBe(true);
+	// cat-file -e exits non-zero (throws) if the object was pruned
+	await git(["--git-dir", shadow.gitDir, "cat-file", "-e", blob], repo);
+});
+
+test("prune keep N keeps the newest N of the current session only", async () => {
+	// sequential creates differ by milliseconds — createdAt (ms ISO in the
+	// commit message) orders them; committerdate (seconds) would tie.
+	await createCheckpoint(opts("entry-1"));
+	await writeFile(join(repo, "a.txt"), "v2\n");
+	await createCheckpoint(opts("entry-2"));
+	await writeFile(join(repo, "a.txt"), "v3\n");
+	await createCheckpoint(opts("entry-3"));
+	await createCheckpoint({
+		shadow,
+		sessionId: "other-session",
+		entryId: "e9",
+	});
+
+	const result = await pruneCheckpoints(shadow, { keep: 1 }, SESSION);
+	expect(result.deleted).toBe(2);
+	expect(result.failed).toBe(0);
+
+	const refs = (await listCheckpointRefs(shadow)).map((l) => l.ref).sort();
+	// newest of OUR session survives; other session untouched
+	expect(refs).toEqual(
+		[
+			checkpointRef(SESSION, "entry-3"),
+			checkpointRef("other-session", "e9"),
+		].sort(),
+	);
+
+	// keep more than exist → no-op
+	const noop = await pruneCheckpoints(shadow, { keep: 99 }, SESSION);
+	expect(noop.deleted).toBe(0);
+});
+
+test("prune keep N never deletes refs with unreadable metadata (fail-closed)", async () => {
+	const cp1 = await createCheckpoint(opts("entry-1"));
+	await writeFile(join(repo, "a.txt"), "v2\n");
+	await createCheckpoint(opts("entry-2"));
+	// forge a same-session ref whose commit has NO CheckpointMeta JSON
+	const bare = await git(
+		["--git-dir", shadow.gitDir, "commit-tree", cp1.worktreeTreeSha, "-m", "no meta"],
+		repo,
+	);
+	await git(
+		["--git-dir", shadow.gitDir, "update-ref", checkpointRef(SESSION, "forged"), bare],
+		repo,
+	);
+
+	const result = await pruneCheckpoints(shadow, { keep: 1 }, SESSION);
+	// only the ORDERABLE older ref goes; the unknown-age ref survives even
+	// though survivors now exceed N
+	expect(result.deleted).toBe(1);
+	const refs = (await listCheckpointRefs(shadow)).map((l) => l.ref).sort();
+	expect(refs).toEqual(
+		[
+			checkpointRef(SESSION, "entry-2"),
+			checkpointRef(SESSION, "forged"),
+		].sort(),
+	);
 });

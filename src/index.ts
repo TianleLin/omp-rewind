@@ -430,10 +430,10 @@ export default function (pi: PiApiLike) {
 				return;
 			}
 			const scope = args.trim() === "all" ? "all" : "others";
-			const deleted = await pruneCheckpoints(shadow, scope, state.sessionId);
+			const result = await pruneCheckpoints(shadow, scope, state.sessionId);
 			if (ctx.hasUI) {
 				ctx.ui.notify(
-					`Pruned ${deleted} checkpoint ref${deleted === 1 ? "" : "s"} (${scope}).`,
+					`Pruned ${result.deleted} checkpoint ref${result.deleted === 1 ? "" : "s"} (${scope}).`,
 					"info",
 				);
 			}
